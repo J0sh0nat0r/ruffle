@@ -1,5 +1,7 @@
+
 use crate::decoder::VideoDecoder;
 use bzip2::read::BzDecoder;
+use futures::future::{maybe_done, FusedFuture, MaybeDone};
 use md5::{Digest, Md5};
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelRegion};
@@ -12,7 +14,10 @@ use slotmap::SlotMap;
 use std::fs::File;
 use std::io::{copy, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
 use swf::{VideoCodec, VideoDeblocking};
+use tokio::runtime::Handle;
+use tokio::task::{block_in_place, spawn_blocking, JoinHandle}
 
 enum ProxyOrStream {
     /// These streams are passed through to the wrapped software
@@ -28,7 +33,7 @@ enum ProxyOrStream {
 /// except for H.264, for which it uses an external decoder.
 pub struct ExternalVideoBackend {
     streams: SlotMap<VideoStreamHandle, ProxyOrStream>,
-    openh264_lib_filepath: Option<PathBuf>,
+    openh264_lib_filepath: MaybeDone<JoinHandle<Option<PathBuf>>>,
     software: SoftwareVideoBackend,
 }
 
@@ -113,15 +118,19 @@ impl ExternalVideoBackend {
     }
 
     pub fn new() -> Self {
-        Self {
-            streams: SlotMap::with_key(),
-            openh264_lib_filepath: match Self::get_openh264() {
+        let openh264_lib_filepath = maybe_done(spawn_blocking(|| {
+            match Self::get_openh264() {
                 Ok(path) => Some(path),
                 Err(e) => {
                     tracing::error!("Couldn't get OpenH264: {}", e);
                     None
                 }
-            },
+            }
+        }));
+
+        Self {
+            streams: SlotMap::with_key(),
+            openh264_lib_filepath,
             software: SoftwareVideoBackend::new(),
         }
     }
@@ -137,16 +146,34 @@ impl VideoBackend for ExternalVideoBackend {
         codec: VideoCodec,
         filter: VideoDeblocking,
     ) -> Result<VideoStreamHandle, Error> {
+        #[cold]
+        fn err_no_openh264() -> Result<VideoStreamHandle, Error> { Err(Error::DecoderError("No OpenH264".into())) }
+
         let proxy_or_stream = if codec == VideoCodec::H264 {
-            let openh264 = &self.openh264_lib_filepath;
-            if let Some(openh264) = openh264 {
-                tracing::info!("Using OpenH264 at {:?}", openh264);
-                let decoder = Box::new(crate::decoder::openh264::H264Decoder::new(openh264));
-                let stream = VideoStream::new(decoder);
-                ProxyOrStream::Owned(stream)
-            } else {
-                return Err(Error::DecoderError("No OpenH264".into()));
-            }
+            let pin = Pin::new(&mut self.openh264_lib_filepath);
+
+            let openh264 = match pin.output_mut() {
+                None if !pin.is_terminated() => {
+                    // Block and wait for the background task to download and verify OpenH264
+                    block_in_place(|| Handle::current().block_on(pin));
+
+                    let Some(Ok(Some(output))) = pin.output_mut() else {
+                        return err_no_openh264();
+                    };
+
+                    output
+                }
+
+                Some(Ok(Some(output))) => output,
+
+                _ => return err_no_openh264()
+            };
+
+            tracing::info!("Using OpenH264 at {:?}", openh264);
+
+            let decoder = Box::new(crate::decoder::openh264::H264Decoder::new(openh264));
+            let stream = VideoStream::new(decoder);
+            ProxyOrStream::Owned(stream)
         } else {
             ProxyOrStream::Proxied(
                 self.software
