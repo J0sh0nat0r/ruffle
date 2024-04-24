@@ -14,10 +14,9 @@ use slotmap::SlotMap;
 use std::fs::File;
 use std::io::{copy, Write};
 use std::path::PathBuf;
-use std::pin::Pin;
 use swf::{VideoCodec, VideoDeblocking};
 use tokio::runtime::Handle;
-use tokio::task::{block_in_place, spawn_blocking, JoinHandle}
+use tokio::task::{block_in_place, spawn_blocking, JoinHandle};
 
 enum ProxyOrStream {
     /// These streams are passed through to the wrapped software
@@ -146,27 +145,14 @@ impl VideoBackend for ExternalVideoBackend {
         codec: VideoCodec,
         filter: VideoDeblocking,
     ) -> Result<VideoStreamHandle, Error> {
-        #[cold]
-        fn err_no_openh264() -> Result<VideoStreamHandle, Error> { Err(Error::DecoderError("No OpenH264".into())) }
-
         let proxy_or_stream = if codec == VideoCodec::H264 {
-            let pin = Pin::new(&mut self.openh264_lib_filepath);
+            if !self.openh264_lib_filepath.is_terminated() {
+                // Block and wait for the background task to download and verify OpenH264
+                block_in_place(|| Handle::current().block_on(&mut self.openh264_lib_filepath));
+            }
 
-            let openh264 = match pin.output_mut() {
-                None if !pin.is_terminated() => {
-                    // Block and wait for the background task to download and verify OpenH264
-                    block_in_place(|| Handle::current().block_on(pin));
-
-                    let Some(Ok(Some(output))) = pin.output_mut() else {
-                        return err_no_openh264();
-                    };
-
-                    output
-                }
-
-                Some(Ok(Some(output))) => output,
-
-                _ => return err_no_openh264()
+            let MaybeDone::Done(Ok(Some(ref openh264))) = self.openh264_lib_filepath else {
+                return Err(Error::DecoderError("No OpenH264".into()))
             };
 
             tracing::info!("Using OpenH264 at {:?}", openh264);
